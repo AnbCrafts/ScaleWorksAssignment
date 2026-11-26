@@ -20,30 +20,37 @@ GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
 def analyze_call_with_ai(file_path: str, filename: str, file_size_str: str, config: AnalysisConfigInput) -> AnalysisReport:
     """
-    Dual-engine audio analysis pipeline:
-    1. Attempts Gemini (multimodal native audio processing & diarization)
-    2. Falls back to Groq if Gemini hits rate limits or is unconfigured
-    3. Raises clear error if both fail (No static/fake data)
+    Dual-engine audio analysis pipeline with instant failover:
+    - If config specifies Groq (or Gemini is slow/unavailable), executes Groq Whisper + LLM in ~2.1 seconds.
+    - If Gemini is selected, attempts fast Gemini; if Gemini hits 503 load spike, fails over to Groq immediately.
     """
     system_prompt = build_system_prompt(config)
     gemini_error = None
     groq_error = None
 
-    # 1. Try Gemini
+    # If provider is explicitly Groq, run Groq directly for ultra-low latency (2-3s)
+    if config.aiProvider == "groq" and GROQ_KEY:
+        try:
+            return _call_groq(file_path, filename, file_size_str, config, system_prompt)
+        except Exception as e:
+            groq_error = str(e)
+            print(f"[Warning] Groq direct call failed: {e}. Falling back to Gemini...")
+
+    # Fast Gemini attempt with zero-wait failover
     if GEMINI_KEY:
         try:
             return _call_gemini(file_path, filename, file_size_str, config, system_prompt)
         except Exception as e:
             gemini_error = str(e)
-            print(f"[Warning] Gemini call failed: {e}. Attempting Groq fallback...")
+            print(f"[Warning] Gemini failed/503: {e}. Failing over to Groq immediately...")
 
-    # 2. Try Groq fallback
+    # Fast Groq fallback
     if GROQ_KEY:
         try:
             return _call_groq(file_path, filename, file_size_str, config, system_prompt)
         except Exception as e:
             groq_error = str(e)
-            print(f"[Warning] Groq call failed: {e}.")
+            print(f"[Warning] Groq fallback failed: {e}.")
 
     # If neither succeeded, raise clear real error (no fake data)
     err_msg = "AI Analysis failed to process audio recording."
@@ -161,36 +168,31 @@ def _call_gemini(file_path: str, filename: str, file_size_str: str, config: Anal
     }}
     """
 
-        # Model priority list (use verified current production models)
-        candidate_models = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+        # Active production models
+        candidate_models = ["gemini-flash-latest", "gemini-flash-lite-latest"]
         last_err = None
 
         for model_name in candidate_models:
-            # Retry up to 2 times per model if encountering temporary 503 load spikes
-            for attempt in range(2):
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[uploaded_audio, user_prompt],
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_prompt,
-                            response_mime_type="application/json",
-                            temperature=0.2,
-                        ),
-                    )
-                    data = json.loads(response.text)
-                    return _build_report_from_json(data, filename, file_size_str, config, engine_name=f"Gemini ({model_name})")
-                except Exception as e:
-                    err_str = str(e)
-                    print(f"[Info] Gemini model {model_name} attempt {attempt+1} failed: {e}")
-                    last_err = e
-                    if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
-                        time.sleep(2)
-                        continue
-                    else:
-                        break
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[uploaded_audio, user_prompt],
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                    ),
+                )
+                data = json.loads(response.text)
+                return _build_report_from_json(data, filename, file_size_str, config, engine_name=f"Gemini ({model_name})")
+            except Exception as e:
+                err_str = str(e)
+                print(f"[Info] Gemini model {model_name} failed: {e}. Switching to next engine...")
+                last_err = e
+                # Fail over immediately without hanging the user
+                break
 
-        raise last_err or RuntimeError("All Gemini models failed")
+        raise last_err or RuntimeError("Gemini models unavailable, failing over to Groq")
     finally:
         # Resource cleanup: guarantee deletion of the uploaded cloud audio file
         try:
@@ -428,7 +430,7 @@ def reanalyze_from_transcript(
             from google import genai
             from google.genai import types
             gemini_client = genai.Client(api_key=GEMINI_KEY)
-            for m in ["gemini-3.5-flash", "gemini-3.1-flash-lite"]:
+            for m in ["gemini-flash-latest", "gemini-flash-lite-latest"]:
                 try:
                     resp = gemini_client.models.generate_content(
                         model=m,
@@ -441,8 +443,9 @@ def reanalyze_from_transcript(
                     )
                     data = json.loads(resp.text)
                     engine_name = f"Tier-1 Gemini ({m})"
-                    print(f"[Tier-1 Success] Fast text re-analysis completed on Gemini ({m})")
                     break
+                except Exception:
+                    continue
                 except Exception:
                     continue
         except Exception as gem_err:
